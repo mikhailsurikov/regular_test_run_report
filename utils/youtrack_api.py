@@ -1,25 +1,10 @@
-import requests
+import re
 from datetime import datetime
+import requests
 from utils.youtrack_client import *
 
 logger = logging.getLogger("airflow.task")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-
-def headers() -> dict:
-    return {
-        "Authorization": f"Bearer {Variable.get('YOUTRACK_TOKEN')}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-
-def base_url() -> str:
-    return Variable.get("YOUTRACK_URL").rstrip("/")
-
-
-def issue_id() -> str:
-    return Variable.get("YOUTRACK_ISSUE_ID")
 
 
 def get_and_update_youtrack_comment(**context):
@@ -32,10 +17,10 @@ def get_and_update_youtrack_comment(**context):
     if not summary:
         raise ValueError("No allure_summary in XCom")
     date_str = summary["date"]  # Формат DD/MM/YYYY
-    # Формируем шапку комментария
+
     final_text = f"**Date:** {date_str}\n\n"
-    # Формируем блок с деталями по каждой джобе
     job_blocks = []
+
     for job_name, job_data in summary["per_job"].items():
         allure_url = job_data.get("plugin_url", "")
         allure_link = f"[Allure Report]({allure_url})" if allure_url else "_No Allure Link_"
@@ -45,14 +30,13 @@ def get_and_update_youtrack_comment(**context):
         failed = stats["failed"]
         errors = stats.get("broken", 0)  # В Allure "broken" = errors
         failed_suites = job_data.get("failed_suites_str", "")
-        # Берем ссылку на скриншот
+
         shot_url = screenshot_urls.get(job_name, "")
-        # Если скриншот есть, вшиваем ссылку в название джобы, иначе просто текст
         if shot_url:
             job_title = f"### [{job_name}]({shot_url})"
         else:
             job_title = f"### {job_name}"
-        # Формируем блок для одной джобы
+
         block = (
             f"{job_title}\n"
             f"{allure_link}\n"
@@ -62,20 +46,23 @@ def get_and_update_youtrack_comment(**context):
             f"{errors} errors\n"
         )
         job_blocks.append(block)
-    # Объединяем блоки
+
     final_text += "\n---\n".join(job_blocks)
-    # Отправляем НОВЫЙ комментарий
+
     url = f"{base_url()}/api/issues/{issue_id()}/comments"
     payload = {"text": final_text}
     logger.info("Creating new YouTrack comment for issue %s", issue_id())
-    logger.debug("Comment text:\n%s", final_text)
 
     r = requests.post(url, json=payload, headers=headers(), timeout=30, verify=False)
-    logger.info("YouTrack response status=%s", r.status_code)
     if r.status_code >= 400:
         logger.error("YouTrack API Error: %s", r.text)
     r.raise_for_status()
-    logger.info("Comment created successfully")
+
+    response_data = r.json()
+    comment_id = response_data.get("id")
+    ti.xcom_push(key="latest_comment_id", value=comment_id)
+
+    logger.info("Comment created successfully with ID: %s", comment_id)
 
 
 TABLE_START_MARKER = "<!-- HISTORY_TABLE_START -->"
@@ -99,25 +86,61 @@ def update_issue_description(new_description: str):
     r.raise_for_status()
 
 
-def build_matrix_row(summary: dict) -> str:
+def _format_metric(current: int, prev_col_str: str, prefix: str, higher_is_better: bool) -> str:
+    """
+    Раскрашивает ТОЛЬКО число, сравнивая его с предыдущим значением.
+    """
+    if not prev_col_str:
+        return f"{prefix}={current}"
+
+    # Ищем паттерн: prefix=123 или prefix=<span ...>123
+    match = re.search(rf'{prefix}=(?:<span[^>]*>)?(\d+)', prev_col_str)
+    if not match:
+        return f"{prefix}={current}"
+
+    previous = int(match.group(1))
+
+    if current == previous:
+        color = "lightcyan"  # Синий (без изменений)
+    elif (current > previous and higher_is_better) or (current < previous and not higher_is_better):
+        color = "palegreen"  # Зеленый (стало лучше)
+    else:
+        color = "mistyrose"  # Красный (стало хуже)
+
+    return f'{prefix}=<span style="background-color:{color};">{current}</span>'
+
+
+def build_matrix_row(summary: dict, header_columns: list, prev_row_str: str) -> str:
     """Формирует новую строку для таблицы."""
     date_str = summary["date"]
+
+    # Просто дата, без ссылки
     row_parts = [f"| {date_str} |"]
 
-    for job in JOBS:
-        job_data = summary["per_job"].get(job)
+    # Разбиваем предыдущую строку, чтобы брать данные из конкретной колонки
+    prev_parts = [p.strip() for p in prev_row_str.split('|')] if prev_row_str else []
+
+    # Идем по колонкам шапки (пропуская Date)
+    for i, col_name in enumerate(header_columns[1:], start=1):
+        job_data = summary["per_job"].get(col_name)
         if not job_data:
             row_parts.append(" |")
             continue
 
         stats = job_data["stats"]
-        cell = (
-            f"T={stats['total']} "
-            f"P={stats['passed']} "
-            f"F={stats['failed']} "
-            f"E={stats.get('broken', 0)} "
-            f"S={stats['skipped']}"
-        )
+
+        # ИСПРАВЛЕНИЕ: prev_parts[0] - это пустая строка, prev_parts[1] - это дата.
+        # Поэтому для первой джобы (i=1) нам нужен prev_parts[2], то есть prev_parts[i + 1]
+        prev_col_data = prev_parts[i + 1] if (i + 1) < len(prev_parts) else ""
+
+        # Применяем логику раскрашивания
+        t_str = _format_metric(stats['total'], prev_col_data, "T", True)
+        p_str = _format_metric(stats['passed'], prev_col_data, "P", True)
+        f_str = _format_metric(stats['failed'], prev_col_data, "F", False)
+        e_str = _format_metric(stats.get('broken', 0), prev_col_data, "E", False)
+        s_str = _format_metric(stats['skipped'], prev_col_data, "S", False)
+
+        cell = f"{t_str} {p_str} {f_str} {e_str} {s_str}"
         row_parts.append(f" {cell} |")
 
     return "".join(row_parts)
@@ -126,6 +149,7 @@ def build_matrix_row(summary: dict) -> str:
 def get_row_date(row: str) -> datetime:
     """Парсит дату из строки для сортировки."""
     try:
+        # Берем второй элемент после разбивки по | (первый пустой, второй - дата)
         parts = row.split('|')
         if len(parts) >= 2:
             date_str = parts[1].strip()
@@ -135,78 +159,76 @@ def get_row_date(row: str) -> datetime:
     return datetime.min
 
 
-def _process_tables(existing_text: str, new_row: str, header: str, sep: str) -> str:
-    """Обновляет таблицу, оставляя 10 строк наверху и пряча остальные в <details>."""
-
-    # Ищем существующий блок с таблицей
+def _process_tables(existing_text: str, summary: dict) -> str:
+    """Обновляет таблицу."""
     start_idx = existing_text.find(TABLE_START_MARKER)
     end_idx = existing_text.find(TABLE_END_MARKER)
 
     if start_idx != -1 and end_idx != -1:
-        # Если маркеры есть, берем текст до и после них
         text_before = existing_text[:start_idx]
         text_after = existing_text[end_idx + len(TABLE_END_MARKER):]
         table_block = existing_text[start_idx + len(TABLE_START_MARKER):end_idx]
     else:
-        # Если маркеров нет (первый запуск), добавляем в конец
         text_before = existing_text + "\n\n"
         text_after = ""
         table_block = ""
 
-    # Собираем все существующие строки данных
-    all_rows = []
-    for line in table_block.splitlines():
+    lines = table_block.splitlines()
+    header_line = ""
+    sep_line = ""
+    data_rows = []
+
+    # Извлекаем существующую шапку и данные
+    for i, line in enumerate(lines):
+        if line.strip().startswith("| Date"):
+            header_line = line.strip()
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("|---"):
+                sep_line = lines[i + 1].strip()
+            break
+
+    if not header_line:
+        header_line = f"| Date | {' | '.join(JOBS)} |"
+        sep_line = f"|------|{'|'.join(['---------------------'] * len(JOBS))}|"
+
+    header_columns = [c.strip() for c in header_line.split('|')[1:-1]]
+
+    for line in lines:
         if line.strip().startswith("|") and not line.strip().startswith("|---") and not line.strip().startswith(
                 "| Date"):
-            all_rows.append(line.strip())
+            data_rows.append(line.strip())
 
-    # Добавляем новую строку
-    all_rows.append(new_row)
+    prev_row_str = data_rows[0] if data_rows else ""
 
-    # Сортируем (новые сверху)
+    new_row = build_matrix_row(summary, header_columns, prev_row_str)
+
+    all_rows = [new_row] + data_rows
     all_rows.sort(key=get_row_date, reverse=True)
 
-    # Разделяем на топ-10 и остальные
     top_10 = all_rows[:10]
     hidden = all_rows[10:]
 
-    # Формируем видимую таблицу
-    result_table = f"{header}\n{sep}\n" + "\n".join(top_10) + "\n\n"
+    result_table = f"{header_line}\n{sep_line}\n" + "\n".join(top_10) + "\n\n"
 
-    # Формируем скрытую таблицу
     if hidden:
         result_table += (
                 f"<details>\n"
                 f"<summary><b>Показать все прошлые запуски ({len(hidden)})</b></summary>\n\n"
-                f"{header}\n{sep}\n" + "\n".join(hidden) + "\n\n"
-                                                           f"</details>\n"
+                f"{header_line}\n{sep_line}\n" + "\n".join(hidden) + "\n\n"
+                                                                     f"</details>\n"
         )
 
-    # Собираем всё вместе с маркерами
     return f"{text_before}{TABLE_START_MARKER}\n{result_table}{TABLE_END_MARKER}{text_after}"
 
 
 def update_youtrack_history_table(**context):
-    """Новая таска для обновления исторической таблицы в описании задачи."""
+    """Обновляет историческую таблицу в описании задачи."""
     ti = context["ti"]
     summary = ti.xcom_pull(task_ids="parse_allure_stats", key="allure_summary")
     if not summary:
         raise ValueError("No allure_summary in XCom")
 
-    # Формируем заголовок таблицы
-    header = f"| Date | {' | '.join(JOBS)} |"
-    sep = f"|------|{'|'.join(['---------------------'] * len(JOBS))}|"
-
-    # Собираем новую строку
-    new_row = build_matrix_row(summary)
-    logger.info("New matrix row: %s", new_row)
-
-    # Получаем текущее описание задачи
     description = get_issue_description()
+    updated_description = _process_tables(description, summary)
 
-    # Обновляем таблицу
-    updated_description = _process_tables(description, new_row, header, sep)
-
-    # Отправляем обратно
     update_issue_description(updated_description)
     logger.info("Successfully updated YouTrack history table in Issue Description")
