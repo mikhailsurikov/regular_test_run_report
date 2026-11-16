@@ -156,9 +156,8 @@ def download_allure_artifacts(**context):
         build_num = task_instance.xcom_pull(task_ids=f"wait_allure_{job}", key=f"build_{job}")
         artifact_path = task_instance.xcom_pull(task_ids=f"wait_allure_{job}", key=f"artifact_{job}")
         if not build_num or not artifact_path:
-            raise ValueError(
-                f"XCom missing for '{job}': build={build_num!r}, artifact={artifact_path!r}. "
-                f"Did 'wait_allure_{job}' succeed?")
+            logger.warning("[%s] No XCom data found (sensor was likely skipped). Ignoring this job.", job)
+            continue
         url = f"{jenkins_url()}/job/{job}/{build_num}/artifact/{artifact_path}"
         logger.info("[%s#%s] Downloading %s", job, build_num, url)
 
@@ -188,6 +187,8 @@ def download_allure_artifacts(**context):
             "index_html": index_html,
             "plugin_url": f"{jenkins_url()}/job/{job}/{build_num}/allure/",
         }
+    if not result:
+        raise ValueError("All sensors were skipped or failed. No reports downloaded.")
     task_instance.xcom_push(key="allure_paths", value=result)
     logger.info("Allure download complete: %d reports in XCom 'allure_paths'", len(result))
     return result

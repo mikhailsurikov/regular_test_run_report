@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import pytz
+from datetime import datetime
 
 logger = logging.getLogger("airflow.task")
 # Часовой пояс для правильного формирования даты
@@ -63,35 +64,61 @@ def parse_single_report(extract_dir: str) -> dict:
 
 def parse_allure_stats(**context):
     """
-    Агрегирует статистику по всем 4 джобам.
-    Формирует данные для шаблона комментария в YouTrack.
+    Агрегирует статистику по всем джобам.
+    Если данных по джобе нет, ставит статус FAILED/NO REPORT.
     """
     ti = context["ti"]
-    allure_paths = ti.xcom_pull(task_ids="download_allure_reports", key="allure_paths")
+    allure_paths = ti.xcom_pull(task_ids="download_allure_reports", key="allure_paths") or {}
+    jobs = context["params"].get("jobs", [])
+    if not jobs:
+        raise ValueError("Received empty 'jobs' list in params. Check DAG configuration.")
+
     if not allure_paths:
-        raise ValueError("No allure_paths in XCom — check download_allure_reports")
+        raise ValueError("No Allure reports were downloaded (allure_paths is empty). Marking DAG as failed.")
 
-    logger.info("Aggregating stats across %d jobs", len(allure_paths))
+    logger.info("Aggregating stats across %d expected jobs", len(jobs))
 
-    # Формируем дату в формате DD/MM/YYYY ---
-    logical_date = context["logical_date"]
-    msk_date = logical_date.astimezone(MSK)
-    date_str = msk_date.strftime("%d/%m/%Y")  # 07/11/2026
-    logger.info("Run date (MSK): %s", date_str)
+    # --- 1. Берем фактическую дату запуска в формате DD/MM/YYYY ---
+    msk_date = datetime.now(pytz.utc).astimezone(MSK)
+    date_str = msk_date.strftime("%d/%m/%Y")
+    logger.info("Actual run date (MSK): %s", date_str)
+
     per_job = {}
-    for job, info in allure_paths.items():
-        # Парсим Allure ---
+
+    # Идем по полному списку джоб, который передали в params
+    for job in jobs:
+        if job not in allure_paths:
+            logger.warning("[%s] No report found. Setting status to FAILED/NO REPORT", job)
+            per_job[job] = {
+                "status": "FAILED/NO REPORT",
+                "stats": {},
+                "plugin_url": "",
+            }
+            continue
+
+        # --- 2. Парсим Allure ---
+        info = allure_paths[job]
         parsed = parse_single_report(info["extract_dir"])
         stats = parsed["stats"]
         suites = parsed["suites"]
-        # Формируем списки сьютов с упавшими тестами и ошибками ---
+        if stats.get("total", 0) == 0:
+            logger.warning("[%s] Report has 0 cases. Marking as FAILED/NO REPORT.", job)
+            per_job[job] = {
+                "status": "FAILED/NO REPORT",
+                "stats": {},
+                "plugin_url": info["plugin_url"],
+            }
+            continue
+        # --- 3. Формируем списки сьютов ---
         failed_suites = [s["name"] for s in suites if s.get("failed", 0) > 0]
         failed_suites_str = ", ".join(failed_suites)
+
         error_suites = [s["name"] for s in suites if s.get("broken", 0) > 0]
         error_suites_str = ", ".join(error_suites)
 
-        # Формируем итоговую структуру для одной джобы ---
+        # --- 4. Формируем итоговую структуру ---
         per_job[job] = {
+            "status": "SUCCESS",
             "build": info["build"],
             "plugin_url": info["plugin_url"],
             "stats": stats,
@@ -99,12 +126,12 @@ def parse_allure_stats(**context):
             "failed_suites_str": failed_suites_str,
             "error_suites_str": error_suites_str,
         }
-    # Собираем финальный словарь для XCom ---
+
     result = {
         "date": date_str,
         "per_job": per_job,
     }
+
     ti.xcom_push(key="allure_summary", value=result)
     logger.info("allure_summary pushed to XCom")
-
     return result

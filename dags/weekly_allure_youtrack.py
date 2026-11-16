@@ -44,6 +44,7 @@ with DAG(
             poke_interval=120,  # проверяем jenkins каждые 2 минуты
             timeout=600,  # ждём максимум 10 минут
             mode="reschedule",  # освобождаем слот воркера между проверками
+            soft_fail=True
         )
         for job in JENKINS_JOBS]
 
@@ -54,22 +55,25 @@ with DAG(
         task_id="download_allure_reports",
         python_callable=download_allure_artifacts,
         params={"jobs": JENKINS_JOBS},
+        trigger_rule="none_failed"
     )
 
     # 3. Парсим распакованные отчёты → статистика по отдельной джобе.
     parse = PythonOperator(
         task_id="parse_allure_stats",
         python_callable=parse_allure_stats,
+        params={"jobs": JENKINS_JOBS}
     )
 
     # 4. Создание скриншота страницы Allure (по одному PNG на джобу).
     screenshot = PythonOperator(
         task_id="take_screenshot",
         python_callable=take_screenshot,
+        params={"jobs": JENKINS_JOBS}
     )
 
     # 5. Добавляем комментарий со статистикой по тест-рану в issue YouTrack.
-    update_comment = PythonOperator(
+    create_comment = PythonOperator(
         task_id="get_and_update_youtrack_comment",
         python_callable=get_and_update_youtrack_comment,
     )
@@ -81,6 +85,6 @@ with DAG(
     )
 
     # Граф зависимостей:
-    #   все 4 сенсора (параллельно) >> download >> parse >> screenshot >> update_comment
+    #   все 4 сенсора (параллельно) >> download >> parse >> screenshot >> create_comment >> update_table
 
-    wait_tasks >> download >> parse >> screenshot >> update_comment >> update_table
+    wait_tasks >> download >> parse >> screenshot >> create_comment >> update_table

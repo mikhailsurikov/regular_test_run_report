@@ -9,33 +9,47 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_and_update_youtrack_comment(**context):
     """
-    Формирует и отправляет НОВЫЙ комментарий в YouTrack.
+    Формирует и отправляет новый комментарий в YouTrack со статистикой по джобам.
     """
     ti = context["ti"]
     summary = ti.xcom_pull(task_ids="parse_allure_stats", key="allure_summary")
     screenshot_urls = ti.xcom_pull(task_ids="take_screenshot", key="screenshots") or {}
     if not summary:
         raise ValueError("No allure_summary in XCom")
-    date_str = summary["date"]  # Формат DD/MM/YYYY
 
+    date_str = summary["date"]  # Формат DD/MM/YYYY
     final_text = f"**Date:** {date_str}\n\n"
     job_blocks = []
 
     for job_name, job_data in summary["per_job"].items():
-        allure_url = job_data.get("plugin_url", "")
-        allure_link = f"[Allure Report]({allure_url})" if allure_url else "_No Allure Link_"
-        stats = job_data["stats"]
-        total = stats["total"]
-        passed = stats["passed"]
-        failed = stats["failed"]
-        errors = stats.get("broken", 0)  # В Allure "broken" = errors
-        failed_suites = job_data.get("failed_suites_str", "")
-
+        # 1. Формируем заголовок со ссылкой на скриншот (работает для всех джоб)
         shot_url = screenshot_urls.get(job_name, "")
         if shot_url:
             job_title = f"### [{job_name}]({shot_url})"
         else:
             job_title = f"### {job_name}"
+
+        # 2. Формируем ссылку на Allure (работает для всех джоб)
+        allure_url = job_data.get("plugin_url", "")
+        allure_link = f"[Allure Report]({allure_url})" if allure_url else "_No Allure Link_"
+
+        # 3. Проверяем статус: если джоба упала или 0 кейсов
+        if job_data.get("status") == "FAILED/NO REPORT":
+            block = (
+                f"{job_title}\n"
+                f"{allure_link}\n"
+                f"<span style=\"color:red;\">**FAILED/NO REPORT**</span>\n"
+            )
+            job_blocks.append(block)
+            continue  # Идем к следующей джобе
+
+        # 4. Если джоба успешна, берем статистику (используем .get для безопасности)
+        stats = job_data.get("stats", {})
+        total = stats.get("total", 0)
+        passed = stats.get("passed", 0)
+        failed = stats.get("failed", 0)
+        errors = stats.get("broken", 0)
+        failed_suites = job_data.get("failed_suites_str", "")
 
         block = (
             f"{job_title}\n"
@@ -86,7 +100,7 @@ def update_issue_description(new_description: str):
     r.raise_for_status()
 
 
-def _format_metric(current: int, prev_col_str: str, prefix: str, higher_is_better: bool) -> str:
+def format_metric(current: int, prev_col_str: str, prefix: str, higher_is_better: bool) -> str:
     """
     Раскрашивает ТОЛЬКО число, сравнивая его с предыдущим значением.
     """
@@ -123,8 +137,8 @@ def build_matrix_row(summary: dict, header_columns: list, prev_row_str: str) -> 
     # Идем по колонкам шапки (пропуская Date)
     for i, col_name in enumerate(header_columns[1:], start=1):
         job_data = summary["per_job"].get(col_name)
-        if not job_data:
-            row_parts.append(" |")
+        if not job_data or job_data.get("status") == "FAILED/NO REPORT":
+            row_parts.append(" <span style=\"color:red;\">FAILED/NO REPORT</span> |")
             continue
 
         stats = job_data["stats"]
@@ -134,11 +148,11 @@ def build_matrix_row(summary: dict, header_columns: list, prev_row_str: str) -> 
         prev_col_data = prev_parts[i + 1] if (i + 1) < len(prev_parts) else ""
 
         # Применяем логику раскрашивания
-        t_str = _format_metric(stats['total'], prev_col_data, "T", True)
-        p_str = _format_metric(stats['passed'], prev_col_data, "P", True)
-        f_str = _format_metric(stats['failed'], prev_col_data, "F", False)
-        e_str = _format_metric(stats.get('broken', 0), prev_col_data, "E", False)
-        s_str = _format_metric(stats['skipped'], prev_col_data, "S", False)
+        t_str = format_metric(stats['total'], prev_col_data, "T", True)
+        p_str = format_metric(stats['passed'], prev_col_data, "P", True)
+        f_str = format_metric(stats['failed'], prev_col_data, "F", False)
+        e_str = format_metric(stats.get('broken', 0), prev_col_data, "E", False)
+        s_str = format_metric(stats['skipped'], prev_col_data, "S", False)
 
         cell = f"{t_str} {p_str} {f_str} {e_str} {s_str}"
         row_parts.append(f" {cell} |")
@@ -159,7 +173,7 @@ def get_row_date(row: str) -> datetime:
     return datetime.min
 
 
-def _process_tables(existing_text: str, summary: dict) -> str:
+def process_tables(existing_text: str, summary: dict) -> str:
     """Обновляет таблицу."""
     start_idx = existing_text.find(TABLE_START_MARKER)
     end_idx = existing_text.find(TABLE_END_MARKER)
@@ -200,8 +214,14 @@ def _process_tables(existing_text: str, summary: dict) -> str:
     prev_row_str = data_rows[0] if data_rows else ""
 
     new_row = build_matrix_row(summary, header_columns, prev_row_str)
-
-    all_rows = [new_row] + data_rows
+    new_row_date = get_row_date(new_row)
+    cleaned_data_rows = []
+    for row in data_rows:
+        if get_row_date(row) != new_row_date:
+            cleaned_data_rows.append(row)
+        else:
+            logger.info("Found duplicate row for date %s. Replacing it.", summary['date'])
+    all_rows = [new_row] + cleaned_data_rows
     all_rows.sort(key=get_row_date, reverse=True)
 
     top_10 = all_rows[:10]
@@ -228,7 +248,7 @@ def update_youtrack_history_table(**context):
         raise ValueError("No allure_summary in XCom")
 
     description = get_issue_description()
-    updated_description = _process_tables(description, summary)
+    updated_description = process_tables(description, summary)
 
     update_issue_description(updated_description)
     logger.info("Successfully updated YouTrack history table in Issue Description")
