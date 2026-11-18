@@ -70,17 +70,16 @@ def get_and_update_youtrack_comment(**context):
     logger.info("Creating new YouTrack comment for issue %s", issue_id())
 
     r = requests.post(url, json=payload, headers=headers(), timeout=30, verify=False)
-
-    response_data = r.json()
-    comment_id = response_data.get("id")
-    ti.xcom_push(key="latest_comment_id", value=comment_id)
-
-    logger.info("Comment created successfully with ID: %s", comment_id)
     try:
         r.raise_for_status()
     except requests.exceptions.HTTPError as e:
         logger.error("YouTrack API Error (Body): %s", r.text)
         raise e  # Пробрасываем ошибку дальше, чтобы Airflow пометил таску как Failed
+    response_data = r.json()
+    comment_id = response_data.get("id")
+    ti.xcom_push(key="latest_comment_id", value=comment_id)
+
+    logger.info("Comment created successfully with ID: %s", comment_id)
 
 
 TABLE_START_MARKER = "<!-- HISTORY_TABLE_START -->"
@@ -91,7 +90,11 @@ def get_issue_description() -> str:
     """Получает текущее описание задачи."""
     url = f"{base_url()}/api/issues/{issue_id()}?fields=description"
     r = requests.get(url, headers=headers(), timeout=30, verify=False)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error("YouTrack API Error (Body): %s", r.text)
+        raise e
     return r.json().get("description", "") or ""
 
 
@@ -100,7 +103,11 @@ def update_issue_description(new_description: str):
     url = f"{base_url()}/api/issues/{issue_id()}"
     payload = {"description": new_description}
     r = requests.post(url, json=payload, headers=headers(), timeout=30, verify=False)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error("YouTrack API Error (Body): %s", r.text)
+        raise e
 
 
 def format_metric(current: int, prev_col_str: str, prefix: str, higher_is_better: bool) -> str:
