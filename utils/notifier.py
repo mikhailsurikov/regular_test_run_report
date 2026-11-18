@@ -15,7 +15,8 @@ def send_failure_alert(context: dict[str, Any]) -> None:
     run_id = context.get("run_id", "unknown")
     logical_date = context.get("logical_date", "unknown")
     log_url = ti.log_url
-
+    if log_url and not log_url.startswith("http"):
+        log_url = "Ссылка на лог недоступна (проверьте AIRFLOW__WEBSERVER__BASE_URL)"
     message = (
         f"**DAG Failed**\n\n"
         f"* **DAG:** `{dag_id}`\n"
