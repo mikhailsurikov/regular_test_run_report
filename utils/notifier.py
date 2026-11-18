@@ -1,7 +1,10 @@
+import logging
 from typing import Any
 import requests
-from utils.youtrack_client import *
+import urllib3
+from utils.youtrack_client import headers, base_url, issue_id
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger("airflow.task")
 
 
@@ -27,12 +30,17 @@ def send_failure_alert(context: dict[str, Any]) -> None:
     logger.info("Sending failure alert to %s", url)
 
     try:
-        # Обратите внимание: используем _headers() вместо headers()
+        # Отправляем POST-запрос, используя заголовки из youtrack_client
         response = requests.post(
-            url, json={"text": message}, headers=headers(), timeout=30, verify=False
+            url,
+            json={"text": message},
+            headers=headers(),
+            timeout=30,
+            verify=False
         )
         logger.info("Alert response status=%s", response.status_code)
         response.raise_for_status()
         logger.info("Failure alert delivered to YouTrack")
     except requests.RequestException as e:
+        # Логируем ошибку, но не роняем сам колбэк, чтобы не скрыть исходную причину падения DAG
         logger.error("Failed to send alert to YouTrack: %s", e)

@@ -7,14 +7,19 @@ from utils.jenkins_api import download_allure_artifacts, wait_for_allure
 from utils.screenshot import take_screenshot
 from utils.youtrack_api import get_and_update_youtrack_comment, update_youtrack_history_table
 from utils.notifier import send_failure_alert
+from airflow.models import Variable
 
 # Список джоб из Jenkins для сбора отчетов.
-JENKINS_JOBS = [
-    "QA110_regular_run_1",
-    "QA110_regular_run_2",
-    "QA110_regular_run_3",
-    "QA110_regular_run_6_SMSSW",
-]
+JENKINS_JOBS = Variable.get(
+    "JENKINS_JOBS",
+    deserialize_json=True,
+    default_var=[
+        "QA110_regular_run_1",
+        "QA110_regular_run_2",
+        "QA110_regular_run_3",
+        "QA110_regular_run_6_SMSSW"
+    ]
+)
 
 default_args = {
     "owner": "qa",

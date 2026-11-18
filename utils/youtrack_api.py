@@ -1,7 +1,9 @@
+import logging
 import re
+import urllib3
 from datetime import datetime
 import requests
-from utils.youtrack_client import *
+from utils.youtrack_client import headers, base_url, issue_id
 
 logger = logging.getLogger("airflow.task")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -68,20 +70,21 @@ def get_and_update_youtrack_comment(**context):
     logger.info("Creating new YouTrack comment for issue %s", issue_id())
 
     r = requests.post(url, json=payload, headers=headers(), timeout=30, verify=False)
-    if r.status_code >= 400:
-        logger.error("YouTrack API Error: %s", r.text)
-    r.raise_for_status()
 
     response_data = r.json()
     comment_id = response_data.get("id")
     ti.xcom_push(key="latest_comment_id", value=comment_id)
 
     logger.info("Comment created successfully with ID: %s", comment_id)
+    try:
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logger.error("YouTrack API Error (Body): %s", r.text)
+        raise e  # Пробрасываем ошибку дальше, чтобы Airflow пометил таску как Failed
 
 
 TABLE_START_MARKER = "<!-- HISTORY_TABLE_START -->"
 TABLE_END_MARKER = "<!-- HISTORY_TABLE_END -->"
-JOBS = ["QA110_regular_run_1", "QA110_regular_run_2", "QA110_regular_run_3", "QA110_regular_run_6_SMSSW"]
 
 
 def get_issue_description() -> str:
@@ -201,8 +204,9 @@ def process_tables(existing_text: str, summary: dict) -> str:
             break
 
     if not header_line:
-        header_line = f"| Date | {' | '.join(JOBS)} |"
-        sep_line = f"|------|{'|'.join(['---------------------'] * len(JOBS))}|"
+        actual_jobs = list(summary["per_job"].keys())
+        header_line = f"| Date | {' | '.join(actual_jobs)} |"
+        sep_line = f"|------|{'|'.join(['---------------------'] * len(actual_jobs))}|"
 
     header_columns = [c.strip() for c in header_line.split('|')[1:-1]]
 

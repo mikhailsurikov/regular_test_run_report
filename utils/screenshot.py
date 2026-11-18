@@ -1,7 +1,6 @@
 import logging
 import os
 import threading
-import time
 from contextlib import contextmanager
 from ftplib import FTP, error_perm
 from functools import partial
@@ -11,6 +10,9 @@ from airflow.models import Variable
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 from utils.jenkins_api import ALLURE_BASE_DIR
@@ -106,12 +108,20 @@ def take_screenshot(**context):
 
     with local_http_server(ALLURE_BASE_DIR) as base_url:
         driver = make_driver()
+        # Задаем максимальное время ожидания элемента (10 секунд)
+        wait = WebDriverWait(driver, 10)
         try:
             for job in allure_paths:
                 url = f"{base_url}/{job}/index.html"
                 logger.info("[%s] Opening %s", job, url)
                 driver.get(url)
-                time.sleep(2)
+                try:
+                    # Ждем, пока на странице появится хотя бы один блок с классом .widget
+                    # (в Allure это контейнеры с графиками и статистикой)
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".widget")))
+                    logger.info("[%s] Report loaded successfully (widgets detected).", job)
+                except Exception as e:
+                    logger.warning("[%s] Timeout waiting for widgets to load. Taking screenshot anyway: %s", job, e)
 
                 date_str = context["ds_nodash"]
                 filename = f"{job}_{date_str}.png"
